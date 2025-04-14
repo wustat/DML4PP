@@ -45,6 +45,8 @@ def Split(K, n_samples, random_state=None, device='cpu'):
 
     return I1
 
+
+# This is the key part to estimate nuisance function m(x) and r(x). 
 def DML(Y, A, X, K=5, epoches = 200, binary_A=True, device='cuda',
         early_stopping_patience=10, early_stopping_delta=1e-4, 
         early_stopping_verbose=False):
@@ -81,10 +83,10 @@ def DML(Y, A, X, K=5, epoches = 200, binary_A=True, device='cuda',
     ap = torch.zeros(n_samples, device=device)
     
 
-    # Split data into K folds
+    # Split data into K folds Note: Outer fold is named k, inner fold is named i
     fold_indices = Split(K, n_samples, random_state=42).cpu().numpy()
 
-    # For each main fold k (validation fold)
+    # For each main fold k 
     for k in range(1, K + 1):
         #print(f"\nMain Fold {k}/{K}:")
         
@@ -106,6 +108,7 @@ def DML(Y, A, X, K=5, epoches = 200, binary_A=True, device='cuda',
         ap_preds = torch.zeros(len(train_idx_k), device=device)
         aBar = []
 
+        # split the training fold into K folds (see https://arxiv.org/pdf/2009.14461 page 8 top)
         fold_inner = Split(K, len(train_idx_k), random_state=42).cpu().numpy()
         # For each model i in 1 to K (excluding k) INNER LOOP
         for i in range(1, K + 1):
@@ -115,7 +118,7 @@ def DML(Y, A, X, K=5, epoches = 200, binary_A=True, device='cuda',
             # Training indices for model i (exclude folds k and i)
             train_idx_i = np.where(fold_inner != i)[0]
             
-            X_train_i = X_train_k[train_idx_i].to(device)
+            X_train_i = X_train_k[train_idx_i].to(device) # this is X^{-k,-j}
             A_train_i = A_train_k[train_idx_i].to(device)
             Y_train_i = Y_train_k[train_idx_i].to(device)
             
@@ -126,8 +129,8 @@ def DML(Y, A, X, K=5, epoches = 200, binary_A=True, device='cuda',
 
             # Initialize models for Wp and E[A|X]
            
-            model_Wp = NuisanceModelY(input_dim=p + A_dim).to(device)
-            model_Atemp = NuisanceModelAtemp(input_dim=p, binary_A=binary_A).to(device)
+            model_Wp = NuisanceModelY(input_dim=p + A_dim).to(device)  # this is full model M_0(A,X), in paper page 8 above eq(7), \hat{M}^{-k,-j} part
+            model_Atemp = NuisanceModelAtemp(input_dim=p, binary_A=binary_A).to(device) # this is full model a_0(X), in paper page 8 above eq(7), \hat{a}^{-k,-j} part
 
             optimizer_Wp = optim.Adam(model_Wp.parameters(), lr=1e-3)
             criterion_Wp = nn.BCEWithLogitsLoss()
@@ -135,7 +138,7 @@ def DML(Y, A, X, K=5, epoches = 200, binary_A=True, device='cuda',
             optimizer_A = optim.Adam(model_Atemp.parameters(), lr=1e-3)
             criterion_A = nn.MSELoss() if not binary_A else nn.BCELoss()
 
-            # Train model_Wp on training data excluding folds k and i
+            # Train M_0(A,X) on training data excluding folds k and i
             train_nuisance_model(model_Wp, optimizer_Wp, criterion_Wp,
                                  A_train_i, Y_train_i, X_train_i,
                                  epochs=epoches, batch_size=64, binary_A=False,
@@ -143,7 +146,7 @@ def DML(Y, A, X, K=5, epoches = 200, binary_A=True, device='cuda',
                                  early_stopping_delta=early_stopping_delta,
                                  early_stopping_verbose=early_stopping_verbose)
 
-            # Train model_A on training data excluding folds k and i
+            # Train a_0(x) on training data excluding folds k and i
             train_nuisance_model(model_Atemp, optimizer_A, criterion_A,
                                  A_train_i, A_train_i, X_train_i,
                                  epochs=epoches, batch_size=64, binary_A=binary_A,
@@ -156,21 +159,24 @@ def DML(Y, A, X, K=5, epoches = 200, binary_A=True, device='cuda',
             model_Atemp.eval()
             with torch.no_grad():
                 outputs_Wp_i = model_Wp(A_val_i, X_val_i)
-                Wp_preds[val_idx_i] = outputs_Wp_i
+                Wp_preds[val_idx_i] = outputs_Wp_i # output of M_0(A,X) for inner fold i, this is probability
 
                 outputs_aptemp_i = model_Atemp(X_val_i)
-                ap_preds[val_idx_i] = outputs_aptemp_i
+                ap_preds[val_idx_i] = outputs_aptemp_i # output of a_0(X) for inner fold i, this is probability
                 
                 outputs_aBar = model_Atemp(X_val_k)
-                aBar.append(outputs_aBar)
+                aBar.append(outputs_aBar)  # in each data -k,-i, this is a_0(X) for fold k, this is probability. We will average this to get final prob for a_0(X) for fold k
 
         # Average predictions over i != k
         Wp_preds = torch.clamp(Wp_preds, 1e-7, 1 - 1e-7)
-        Wp_logits = logit(Wp_preds)
-        aBar_mean = torch.stack(aBar, dim=0).mean(dim=0)
-        Ares2 = A_train_k - ap_preds
-        betaNi = (Ares2 * Wp_logits).sum()/ (Ares2**2).sum()
-        model_logits_X = NuisanceModeltnk(input_dim=p).to(device)
+        Wp_logits = logit(Wp_preds) # logits for M_0(A,X) for data -k
+        aBar_mean = torch.stack(aBar, dim=0).mean(dim=0) # avg prob of a_0(x) for fold k
+        
+        Ares2 = A_train_k - ap_preds 
+        betaNi = (Ares2 * Wp_logits).sum()/ (Ares2**2).sum() # these two lines is for page 8, eq(7), estimate beta_Ni. length of Ares2 is |I_{-k}|
+        
+        
+        model_logits_X = NuisanceModeltnk(input_dim=p).to(device) # model for t_0(x) in page 8, above eq(8), regress logits on X
         optimizer_logits_X = optim.Adam(model_logits_X.parameters(), lr=1e-3)
         criterion_logits_X = nn.MSELoss()
         train_nuisance_model(model_logits_X, optimizer_logits_X, criterion_logits_X,
@@ -182,11 +188,13 @@ def DML(Y, A, X, K=5, epoches = 200, binary_A=True, device='cuda',
         
         model_logits_X.eval()
         tnk = model_logits_X(X_val_k)
-        rnk = tnk - betaNi * aBar_mean  # this requires the number of total samples to be integer multiple of K^2
+        rnk = tnk - betaNi * aBar_mean  # this requires the number of total samples to be integer multiple of K^2, eq(8) in page 8
         
         rXp[val_idx_k] = rnk
 
-        # Train model_AY0: E[A | Y=0, X] on training data excluding fold k
+        # Train model_AY0: E[A | Y=0, X] on training data excluding fold k, page 7 above Proposition 1, \hat{m}^{-k}
+        # this is for m(x) in moment condition, only for Y=0 data points
+        
         #print("  Training model_AY0: E[A | Y=0, X]")
         
         model_AY0 = NuisanceModelAY0(input_dim=p, binary_A=binary_A).to(device)
@@ -242,6 +250,8 @@ def Estimate(Y, A, dml, beta_init=1.0, lr=1e-3, epochs=200, device='cuda', real_
     
     Returns:
     - beta_estimated (float): Estimated causal parameter beta0
+    
+    # Note: This is the moment condition in page 4, neyman orthogonal score. Here I ignore \phi(x) since it's not implemented in their code.
     """
     # Initialize beta as a tensor with requires_grad=True
     beta = torch.tensor(beta_init, device=device, dtype=torch.float32, requires_grad=True)
